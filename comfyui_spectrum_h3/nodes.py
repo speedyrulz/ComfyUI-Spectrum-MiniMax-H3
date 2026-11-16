@@ -297,6 +297,23 @@ class SpectrumApplyMiniMaxH3:
                         ),
                     },
                 ),
+                "max_forecast_run": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 4,
+                        "step": 1,
+                        "tooltip": (
+                            "Experimental. Maximum consecutive forecasts before a real evaluation, for deterministic "
+                            "native Euler only (s_churn 0); every other sampler stays at 1, and "
+                            "selective_rollback_correction, anchor_residual_feedback and any model_aware_mode other "
+                            "than off force 1. The final quarter of the schedule always stays at 1. "
+                            "Quality is unverified: compare at a fixed seed. Longer runs only grow in as window_size "
+                            "and flex_window allow."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -334,6 +351,7 @@ class SpectrumApplyMiniMaxH3:
         generic_correction_limit=0.40,
         generic_correction_attenuation="no_attenuation",
         sa_pece_forecast_policy="balanced",
+        max_forecast_run=1,
     ):
         if not enabled:
             return (model,)
@@ -387,6 +405,7 @@ class SpectrumApplyMiniMaxH3:
             generic_correction_limiter=str(generic_correction_limiter),
             generic_correction_limit=float(generic_correction_limit),
             sa_pece_forecast_policy=str(sa_pece_forecast_policy),
+            max_forecast_run=int(max_forecast_run),
             debug=bool(debug),
         ).validate()
         patched = model.clone()

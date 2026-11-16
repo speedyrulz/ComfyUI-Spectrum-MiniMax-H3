@@ -377,4 +377,4 @@ def test_saved_workflow_default_adds_no_public_rls_lambda_control():
         "generic_correction_limit"
     )
     assert "generic_correction_rls_lambda" not in optional
-    assert keys[-1] == "sa_pece_forecast_policy"
+    assert keys[-2:] == ["sa_pece_forecast_policy", "max_forecast_run"]

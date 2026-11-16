@@ -1461,6 +1461,17 @@ class SpectrumH3Runtime:
             reason = "post-forecast sampler refresh"
             advances_window = False
             bootstrap_forecast = False
+        if (
+            not actual
+            and forecast_limit is not None
+            and forecast_limit > 1
+            and self._consecutive_forecasts >= 1
+            and policy_step_id >= math.ceil(0.75 * policy_total_steps)
+        ):
+            actual = True
+            reason = "late-schedule forecast-run limit"
+            advances_window = False
+            bootstrap_forecast = False
         if not actual and self._required_actual_refreshes > 0:
             actual = True
             reason = "post-forecast sampler refresh"
@@ -2722,7 +2733,9 @@ class SpectrumH3Runtime:
             if step.used_history_rows != expected_rows:
                 raise ForecastRetryActual("forecast branch-row allocation was incomplete")
             self._consecutive_forecasts += 1
-            self._required_actual_refreshes = self._run.min_actual_steps_after_forecast
+            forecast_cap = self._run.max_consecutive_forecasts
+            if forecast_cap is None or self._consecutive_forecasts >= forecast_cap:
+                self._required_actual_refreshes = self._run.min_actual_steps_after_forecast
             if self._run.separate_stage_histories:
                 self._stage_required_actual_refreshes[step.stage_index] = max(
                     1,

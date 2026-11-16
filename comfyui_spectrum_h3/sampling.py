@@ -2046,7 +2046,43 @@ def _native_er_sde_preflight_reason(
     return None
 
 
-def max_consecutive_forecasts(sampler: Any) -> int | None:
+def _native_euler_forecast_run_supported(sampler: Any) -> bool:
+    try:
+        import comfy.k_diffusion.sampling as native_sampling
+    except ImportError:
+        return False
+
+    if getattr(sampler, "sampler_function", None) is not native_sampling.sample_euler:
+        return False
+    options = getattr(sampler, "extra_options", None)
+    if options is None:
+        options = {}
+    if not isinstance(options, dict):
+        return False
+    if set(options) - {"s_churn", "s_tmin", "s_tmax", "s_noise"}:
+        return False
+    churn = options.get("s_churn", 0.0)
+    if isinstance(churn, bool):
+        return False
+    try:
+        return float(churn) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def max_consecutive_forecasts(sampler: Any, config: Any = None) -> int | None:
+    if (
+        config is not None
+        and config.max_forecast_run > 1
+        # These modes learn or score forecast error as if every forecast were
+        # one step from its anchor (rollback also requires forecast->actual
+        # alternation), so longer runs stay off while any of them is active.
+        and not config.selective_rollback_correction
+        and not config.anchor_residual_feedback
+        and config.model_aware_mode == "off"
+        and _native_euler_forecast_run_supported(sampler)
+    ):
+        return int(config.max_forecast_run)
     name = sampler_name(sampler)
     if name in SA_SOLVER_SAMPLERS and _sa_solver_is_stochastic(sampler):
         # Native SA stores every denoised result in pred_list and feeds that
@@ -2441,7 +2477,7 @@ def outer_sample_wrapper(
             run_sigmas,
             name,
             supported_sampler=sampler_is_supported(sampler),
-            max_consecutive_forecasts=max_consecutive_forecasts(sampler),
+            max_consecutive_forecasts=max_consecutive_forecasts(sampler, runtime.config),
             min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
             min_actual_prefix_steps=phase_prefix,
             min_sampler_actual_prefix_steps=pece_policy_prefix,
@@ -2533,7 +2569,7 @@ def outer_sample_wrapper(
                 sa_stochastic_input_steps,
                 sa_forced_actual_steps,
                 min_actual_steps_after_forecast(sampler) if name in SA_SOLVER_SAMPLERS else 0,
-                max_consecutive_forecasts(sampler) if name in SA_SOLVER_SAMPLERS else 0,
+                max_consecutive_forecasts(sampler, runtime.config) if name in SA_SOLVER_SAMPLERS else 0,
                 bool(name in SA_SOLVER_SAMPLERS and stochastic_sa),
                 runtime.config.sa_pece_forecast_policy if active_pece else "-",
                 pece_policy_prefix if active_pece else 0,
