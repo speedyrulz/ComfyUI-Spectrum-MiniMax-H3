@@ -33,6 +33,7 @@ class SpectrumH3Config:
     generic_correction_limit: float = 0.40
     generic_correction_attenuation: str = "no_attenuation"
     sa_pece_forecast_policy: str = "balanced"
+    max_forecast_run: int = 1
 
     def __post_init__(self) -> None:
         trajectory_modes = {
@@ -185,6 +186,12 @@ class SpectrumH3Config:
             raise ValueError(
                 "sa_pece_forecast_policy must be 'balanced', 'stable_start', or 'max_speed'"
             )
+        if (
+            isinstance(self.max_forecast_run, bool)
+            or not isinstance(self.max_forecast_run, int)
+            or not 1 <= self.max_forecast_run <= 4
+        ):
+            raise ValueError("max_forecast_run must be an integer from 1 to 4")
         if self.generic_correction_limiter not in {
             "rational",
             "hard_clip",
