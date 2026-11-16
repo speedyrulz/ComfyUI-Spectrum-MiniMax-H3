@@ -37,6 +37,7 @@ class ERSDEStepDescriptor:
 class _PendingIncrement:
     target_step_id: int
     value: torch.Tensor
+    state_scale: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +117,7 @@ class ERSDEStochasticTracker:
         debug: bool,
         run_id: int,
         external_increment: bool = False,
+        max_dense_gap: int = 1,
     ) -> None:
         if not math.isfinite(float(effective_s_noise)) or effective_s_noise <= 0.0:
             raise ValueError("ER-SDE stochastic tracking requires positive finite s_noise")
@@ -126,6 +128,14 @@ class ERSDEStochasticTracker:
         self.debug = bool(debug)
         self.run_id = int(run_id)
         self.external_increment = bool(external_increment)
+        if isinstance(max_dense_gap, bool) or not isinstance(max_dense_gap, int) or max_dense_gap < 1:
+            raise ValueError("max_dense_gap must be an integer >= 1")
+        self.max_dense_gap = max_dense_gap
+        self._dense_streak_anchor = None
+        self._dense_streak_weight = None
+        self._dense_streak_hold = None
+        self._previous_nonactual_step = None
+        self._cumulative_increment = None
         self._scaler_prefix: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._scaler_calls = 0
         self._noise_calls = 0
@@ -243,7 +253,9 @@ class ERSDEStochasticTracker:
                 raise ERSDETrackingError(
                     "ER-SDE stochastic increment shape changed through scalar scaling"
                 )
-            self._pending = _PendingIncrement(target_step_id, increment)
+            alpha_s = sigma / er_lambda_s
+            state_scale = (alpha_t / alpha_s) * r if self.max_dense_gap > 1 else None
+            self._pending = _PendingIncrement(target_step_id, increment, state_scale)
         self._scaler_prefix.clear()
         self._scaler_calls = 0
         return noise
@@ -340,7 +352,7 @@ class ERSDEStochasticTracker:
         if descriptor.mode != "forecast" or not self._denoised_anchors:
             return False
         latest = self._denoised_anchors[-1]
-        return descriptor.step_id == latest.step_id + 1
+        return 1 <= descriptor.step_id - latest.step_id <= self.max_dense_gap
 
     def consume(
         self,
@@ -357,11 +369,16 @@ class ERSDEStochasticTracker:
             raise ERSDETrackingError("ER-SDE model result is not a packed tensor")
         self._validate_descriptor(descriptor)
 
+        pending = self._pending
+        increment = self._take_pending(denoised, descriptor)
         dense_prediction = None
         if self._causal_dense_output_ready(descriptor):
             try:
                 dense_prediction = self.predict_causal_denoised(denoised, descriptor)
             except ERSDEDenseOutputError as exc:
+                if self.max_dense_gap > 1 and self._denoised_anchors:
+                    self._dense_streak_anchor = self._denoised_anchors[-1].step_id
+                    self._dense_streak_hold = True
                 # Fail closed to the already-reviewed direct-q correction. The dense
                 # path is an ER-SDE forecast refinement, not a prerequisite for the
                 # existing stochastic ownership contract.
@@ -373,7 +390,16 @@ class ERSDEStochasticTracker:
                         exc,
                     )
 
-        increment = self._take_pending(denoised, descriptor)
+        if self.max_dense_gap > 1 and not self.external_increment:
+            if increment is not None and descriptor.requires_compensation:
+                if (self._previous_nonactual_step == descriptor.step_id - 1
+                        and self._cumulative_increment is not None):
+                    increment = pending.state_scale * self._cumulative_increment + increment
+                self._cumulative_increment = increment
+                self._previous_nonactual_step = descriptor.step_id
+            else:
+                self._cumulative_increment = None
+                self._previous_nonactual_step = None
         if increment is None:
             reason = "first_step" if descriptor.step_id == 0 else "no_pending_increment"
             self._debug_log(denoised, descriptor, None, False, reason)
@@ -470,11 +496,14 @@ class ERSDEStochasticTracker:
             raise ERSDEDenseOutputError(
                 "ER-SDE dense-output anchor is not strictly earlier than the forecast"
             )
-        if descriptor.step_id != latest.step_id + 1:
+        if not 1 <= descriptor.step_id - latest.step_id <= self.max_dense_gap:
             raise ERSDEDenseOutputError(
-                "ER-SDE dense output requires the latest actual anchor immediately before "
-                f"the forecast (anchor={latest.step_id}, forecast={descriptor.step_id})"
+                f"ER-SDE dense output gap exceeds limit (anchor={latest.step_id}, forecast={descriptor.step_id})"
             )
+        if self.max_dense_gap > 1 and self._dense_streak_anchor != latest.step_id:
+            self._dense_streak_anchor = latest.step_id
+            self._dense_streak_weight = None
+            self._dense_streak_hold = None
         if (
             latest.value.shape != raw_denoised.shape
             or latest.value.device != raw_denoised.device
@@ -486,6 +515,8 @@ class ERSDEStochasticTracker:
 
         if len(self._denoised_anchors) == 1:
             predicted = latest.value.clone(memory_format=torch.contiguous_format)
+            if self.max_dense_gap > 1:
+                self._dense_streak_hold = True
             return ERSDEDenseOutputPrediction(
                 value=predicted,
                 mode="latest_actual_hold",
@@ -509,6 +540,8 @@ class ERSDEStochasticTracker:
         # exact solver-space denoised anchor for the first post-prefix forecast.
         if latest.step_id - previous.step_id == 1:
             predicted = latest.value.clone(memory_format=torch.contiguous_format)
+            if self.max_dense_gap > 1:
+                self._dense_streak_hold = True
             return ERSDEDenseOutputPrediction(
                 value=predicted,
                 mode="latest_actual_hold_consecutive_anchors",
@@ -525,6 +558,8 @@ class ERSDEStochasticTracker:
             or previous_coordinate is None
         ):
             predicted = latest.value.clone(memory_format=torch.contiguous_format)
+            if self.max_dense_gap > 1:
+                self._dense_streak_hold = True
             return ERSDEDenseOutputPrediction(
                 value=predicted,
                 mode="latest_actual_hold_missing_coordinate",
@@ -548,10 +583,24 @@ class ERSDEStochasticTracker:
             & (denominator.abs() > 1e-12 * scale)
             & (denominator * advance >= 0.0)
             & (alpha >= -1e-6)
-            & (alpha <= 1.0 + 1e-6)
         )
+        if self.max_dense_gap == 1:
+            valid = valid & (alpha <= 1.0 + 1e-6)
         bounded_alpha = alpha.clamp(0.0, 1.0)
         weight = torch.where(valid, bounded_alpha, torch.zeros_like(bounded_alpha))
+        if self.max_dense_gap > 1:
+            # A hold already forced earlier in this streak (dense error or an
+            # early-return hold branch) stays a hold for the rest of the streak.
+            if self._dense_streak_hold is not True:
+                if self._dense_streak_weight is None:
+                    self._dense_streak_hold = (~valid) | (weight == 0)
+                else:
+                    weight = torch.where(valid, torch.maximum(weight, self._dense_streak_weight), torch.zeros_like(weight))
+            if self._dense_streak_hold is True:
+                weight = torch.zeros_like(weight)
+            elif self._dense_streak_hold is not None:
+                weight = torch.where(self._dense_streak_hold, torch.zeros_like(weight), weight)
+            self._dense_streak_weight = weight
         weight = weight.to(device=latest.value.device, dtype=latest.value.dtype)
         predicted = torch.lerp(latest.value, previous.value, -weight)
         mode = "lambda_bounded_extrapolation"
@@ -571,6 +620,11 @@ class ERSDEStochasticTracker:
         self._scaler_calls = 0
         self._solver_coordinates.clear()
         self._denoised_anchors.clear()
+        self._dense_streak_anchor = None
+        self._dense_streak_weight = None
+        self._dense_streak_hold = None
+        self._previous_nonactual_step = None
+        self._cumulative_increment = None
 
     @staticmethod
     def _rms(value: torch.Tensor) -> float:

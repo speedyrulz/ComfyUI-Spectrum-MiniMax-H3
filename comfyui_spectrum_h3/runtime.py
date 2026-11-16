@@ -271,6 +271,7 @@ class _RunState:
     sigma_max: float
     supported_sampler: bool
     max_consecutive_forecasts: int | None
+    multi_forecast_requires_prior_streak: bool
     min_actual_steps_after_forecast: int
     min_tail_actual_steps: int
     min_actual_prefix_steps: int
@@ -287,6 +288,7 @@ class RuntimeRollbackSnapshot:
     history_labels: tuple[Any, ...] | None
     current_window: float
     consecutive_forecasts: int
+    completed_forecast_streak: bool
     required_actual_refreshes: int
     stage_required_actual_refreshes: tuple[tuple[int, int], ...]
     required_feedback_actuals: int
@@ -328,6 +330,7 @@ class SpectrumH3Runtime:
         self._history_labels: tuple[Any, ...] | None = None
         self._current_window = float(self.config.window_size)
         self._consecutive_forecasts = 0
+        self._completed_forecast_streak = False
         self._required_actual_refreshes = 0
         self._stage_required_actual_refreshes: dict[int, int] = {}
         self._required_feedback_actuals = 0
@@ -799,6 +802,7 @@ class SpectrumH3Runtime:
         *,
         supported_sampler: bool,
         max_consecutive_forecasts: int | None = None,
+        multi_forecast_requires_prior_streak: bool = False,
         min_actual_steps_after_forecast: int = 0,
         min_tail_actual_steps: int = 0,
         min_actual_prefix_steps: int = 0,
@@ -1052,6 +1056,7 @@ class SpectrumH3Runtime:
             sigma_max=sigma_max,
             supported_sampler=effective_supported,
             max_consecutive_forecasts=max_consecutive_forecasts,
+            multi_forecast_requires_prior_streak=multi_forecast_requires_prior_streak,
             min_actual_steps_after_forecast=min_actual_steps_after_forecast,
             min_tail_actual_steps=min_tail_actual_steps,
             min_actual_prefix_steps=min(
@@ -1098,6 +1103,7 @@ class SpectrumH3Runtime:
         self._history_labels = None
         self._current_window = float(self.config.window_size)
         self._consecutive_forecasts = 0
+        self._completed_forecast_streak = False
         self._required_actual_refreshes = 0
         self._stage_required_actual_refreshes = (
             {stage_index: 0 for stage_index in range(stage_count)}
@@ -1182,6 +1188,7 @@ class SpectrumH3Runtime:
         self._history_topology = None
         self._history_labels = None
         self._consecutive_forecasts = 0
+        self._completed_forecast_streak = False
         self._required_actual_refreshes = 0
         self._stage_required_actual_refreshes = {}
         self._required_feedback_actuals = 0
@@ -1470,6 +1477,12 @@ class SpectrumH3Runtime:
         ):
             actual = True
             reason = "late-schedule forecast-run limit"
+            advances_window = False
+            bootstrap_forecast = False
+        if (not actual and self._run.multi_forecast_requires_prior_streak
+                and not self._completed_forecast_streak and self._consecutive_forecasts >= 1):
+            actual = True
+            reason = "first forecast streak refresh"
             advances_window = False
             bootstrap_forecast = False
         if not actual and self._required_actual_refreshes > 0:
@@ -2885,6 +2898,8 @@ class SpectrumH3Runtime:
                             == combined.data_ptr()
                         ),
                     )
+            if self._consecutive_forecasts:
+                self._completed_forecast_streak = True
             self._consecutive_forecasts = 0
             self._required_actual_refreshes = max(0, self._required_actual_refreshes - 1)
             if self._run.separate_stage_histories:
@@ -2966,6 +2981,7 @@ class SpectrumH3Runtime:
             history_labels=self._history_labels,
             current_window=self._current_window,
             consecutive_forecasts=self._consecutive_forecasts,
+            completed_forecast_streak=self._completed_forecast_streak,
             required_actual_refreshes=self._required_actual_refreshes,
             stage_required_actual_refreshes=tuple(
                 sorted(self._stage_required_actual_refreshes.items())
@@ -3101,6 +3117,7 @@ class SpectrumH3Runtime:
         self._history_labels = snapshot.history_labels
         self._current_window = snapshot.current_window
         self._consecutive_forecasts = snapshot.consecutive_forecasts
+        self._completed_forecast_streak = snapshot.completed_forecast_streak
         self._required_actual_refreshes = snapshot.required_actual_refreshes
         self._stage_required_actual_refreshes = dict(
             snapshot.stage_required_actual_refreshes
