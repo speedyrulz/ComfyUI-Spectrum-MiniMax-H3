@@ -39,6 +39,7 @@ from .runtime import (
 )
 
 LOG = logging.getLogger(__name__)
+ER_SDE_MAX_FORECAST_RUN = 2
 
 BINDING_KEY = "spectrum_h3_binding"
 RUNTIME_KEY = "spectrum_h3_runtime"
@@ -2070,6 +2071,25 @@ def _native_euler_forecast_run_supported(sampler: Any) -> bool:
         return False
 
 
+def _native_er_sde_forecast_run_supported(sampler: Any) -> bool:
+    try:
+        import comfy.k_diffusion.sampling as native_sampling
+        if getattr(sampler, "sampler_function", None) is not native_sampling.sample_er_sde:
+            return False
+        options = getattr(sampler, "extra_options", None)
+        if options is None:
+            options = {}
+        if not isinstance(options, dict):
+            return False
+        noise = options.get("s_noise", 1.0)
+        if isinstance(noise, (bool, str, bytes)):
+            return False
+        noise = float(noise)
+        return math.isfinite(noise) and noise > 0 and _er_sde_tracking_contract(sampler)[0]
+    except (ImportError, AttributeError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def max_consecutive_forecasts(sampler: Any, config: Any = None) -> int | None:
     if (
         config is not None
@@ -2080,9 +2100,11 @@ def max_consecutive_forecasts(sampler: Any, config: Any = None) -> int | None:
         and not config.selective_rollback_correction
         and not config.anchor_residual_feedback
         and config.model_aware_mode == "off"
-        and _native_euler_forecast_run_supported(sampler)
     ):
-        return int(config.max_forecast_run)
+        if _native_euler_forecast_run_supported(sampler):
+            return int(config.max_forecast_run)
+        if _native_er_sde_forecast_run_supported(sampler):
+            return min(int(config.max_forecast_run), ER_SDE_MAX_FORECAST_RUN)
     name = sampler_name(sampler)
     if name in SA_SOLVER_SAMPLERS and _sa_solver_is_stochastic(sampler):
         # Native SA stores every denoised result in pred_list and feeds that
@@ -2473,11 +2495,45 @@ def outer_sample_wrapper(
             if active_pece
             else None
         )
+        resolved_cap = max_consecutive_forecasts(sampler, runtime.config)
+        er_multi = resolved_cap is not None and resolved_cap > 1 and _native_er_sde_forecast_run_supported(sampler)
+        effective_noise_unavailable = False
+        if er_multi:
+            try:
+                model_sampling = guider.model_patcher.get_model_object("model_sampling")
+                noise_scale = float(getattr(model_sampling, "noise_scale", 1.0))
+                effective_noise = float((getattr(sampler, "extra_options", None) or {}).get("s_noise", 1.0)) * noise_scale
+                effective_noise_unavailable = not math.isfinite(effective_noise) or effective_noise <= 0
+            except (AttributeError, TypeError, ValueError, RuntimeError, OverflowError):
+                effective_noise_unavailable = True
+            if effective_noise_unavailable:
+                resolved_cap = 1
+                er_multi = False
+        if runtime.config.max_forecast_run > 1 and (resolved_cap or 1) < runtime.config.max_forecast_run:
+            if runtime.config.selective_rollback_correction:
+                reason = "selective_rollback_correction forces 1"
+            elif runtime.config.anchor_residual_feedback:
+                reason = "anchor_residual_feedback forces 1"
+            elif runtime.config.model_aware_mode != "off":
+                reason = "model_aware_mode forces 1"
+            elif effective_noise_unavailable:
+                reason = "effective ER-SDE s_noise is zero or unavailable"
+            elif er_multi:
+                reason = "native ER-SDE is limited to 2"
+            elif name == "sample_er_sde" and isinstance(getattr(sampler, "extra_options", None), dict) and isinstance(sampler.extra_options.get("s_noise", 1.0), (int, float)) and sampler.extra_options.get("s_noise", 1.0) == 0:
+                reason = "ER-SDE s_noise is 0"
+            else:
+                reason = (
+                    f"sampler {name} does not support it (only deterministic native Euler, and native "
+                    "ER-SDE with positive s_noise and the reviewed tracking contract)"
+                )
+            LOG.warning("Spectrum H3 max_forecast_run reduced to %s: %s", resolved_cap or 1, reason)
         run_id = runtime.start_run(
             run_sigmas,
             name,
             supported_sampler=sampler_is_supported(sampler),
-            max_consecutive_forecasts=max_consecutive_forecasts(sampler, runtime.config),
+            max_consecutive_forecasts=resolved_cap,
+            multi_forecast_requires_prior_streak=er_multi,
             min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
             min_actual_prefix_steps=phase_prefix,
             min_sampler_actual_prefix_steps=pece_policy_prefix,
@@ -3116,6 +3172,7 @@ def _run_tracked_er_sde(
             debug=runtime.config.debug,
             run_id=int(runtime.active_run_id),
             external_increment=refdelta_external_increment,
+            max_dense_gap=runtime._run.max_consecutive_forecasts or 1,
         )
         tracked_options = dict(options)
         tracked_options["noise_sampler"] = tracker.noise_sampler

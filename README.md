@@ -252,8 +252,8 @@ Forecasting is fail-closed and allowlisted for reviewed sampler contracts.
 | Sampler | Function | Spectrum policy |
 |---|---|---|
 | Euler | `sample_euler` | At most one forecast before an actual refresh; the experimental `max_forecast_run` (deterministic native Euler only) can allow up to 4. |
-| Native ER-SDE | `sample_er_sde` | Same conservative cadence plus stochastic-state tracking and solver-space dense output. |
-| RefDelta ER-SDE | `sample_refdelta_er_sde` | Requires RefDelta Solver v0.2.0+; preserves actual-only evidence and transfers the exact adaptive stochastic increment. |
+| Native ER-SDE | `sample_er_sde` | Experimental runs up to 2 forecasts; the first streak stays at 1, with cumulative stochastic compensation and solver-space dense output. |
+| RefDelta ER-SDE | `sample_refdelta_er_sde` | At most 1 forecast; requires RefDelta Solver v0.2.0+ and transfers the exact adaptive stochastic increment. |
 | MiniMax H3 Turbo | `_turbo_sampler` | Reviewed deterministic single-call contract. |
 | RES multistep | `sample_res_multistep` | One exact refresh after each forecast; final-tail protection follows `tail_actual_steps`. |
 | RES multistep CFG++ | `sample_res_multistep_cfg_pp` | Same one-refresh rule; no sampler-specific final-tail floor. |
@@ -621,11 +621,11 @@ No speculative `torch.cuda.empty_cache()` or forced device synchronization is pe
 | `generic_correction_limit` | `0.40` | Validated symmetric gain bound. |
 | `anchor_residual_feedback` | `false` | Experimental actual-refresh guard; single-pass only. |
 | `selective_rollback_correction` | `false` | Experimental deterministic-Euler rollback path; single-pass only. |
-| `max_forecast_run` | `1` | Experimental, 1-4. Allows up to this many consecutive forecasts before a real evaluation on deterministic native Euler only (`s_churn` 0); see below. |
+| `max_forecast_run` | `1` | Experimental, 1-4. Allows consecutive forecasts on deterministic native Euler and up to 2 on native ER-SDE; see below. |
 
 ### `max_forecast_run` (experimental)
 
-The default `1` keeps the reviewed cadence (at most one forecast between actual evaluations) and is identical to earlier releases. Values 2-4 let the exact native deterministic `sample_euler` (no churn, no unknown options) run that many consecutive forecasts before a real evaluation. Every other sampler stays at 1; `selective_rollback_correction`, `anchor_residual_feedback` and any `model_aware_mode` other than `off` force 1 (they score or learn forecast error as if each forecast were one step from its anchor); and the final quarter of the schedule always stays at 1. Longer runs only appear as `window_size` and `flex_window` allow the interval to grow. Output quality at values above 1 is unverified; compare at a fixed seed before relying on it.
+The default `1` keeps the reviewed cadence (at most one forecast between actual evaluations) and is identical to earlier releases. Values 2-4 let the exact native deterministic `sample_euler` (no churn, no unknown options) run that many consecutive forecasts before a real evaluation. Exact native `sample_er_sde` with positive finite `s_noise` and the reviewed tracking contract allows up to 2; its first streak after warmup or prefix stays at 1, and consecutive non-actual steps use cumulative exact-increment compensation. With a value above 1, an ER-SDE dense-output extrapolation that would overshoot is clamped to the full anchor slope instead of falling back to a hold, and the weight never drops within a streak. Any value above what the sampler supports logs one warning per run that names the reason. RefDelta ER-SDE and every other sampler stay at 1; `selective_rollback_correction`, `anchor_residual_feedback` and any `model_aware_mode` other than `off` force 1 (they score or learn forecast error as if each forecast were one step from its anchor); and the final quarter of the schedule always stays at 1. Longer runs only appear as `window_size` and `flex_window` allow the interval to grow. Output quality at values above 1 is unverified; compare at a fixed seed before relying on it.
 
 ## Research / objective media nodes
 

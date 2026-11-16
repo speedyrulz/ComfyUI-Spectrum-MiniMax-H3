@@ -306,7 +306,8 @@ class SpectrumApplyMiniMaxH3:
                         "step": 1,
                         "tooltip": (
                             "Experimental. Maximum consecutive forecasts before a real evaluation, for deterministic "
-                            "native Euler only (s_churn 0); every other sampler stays at 1, and "
+                            "native Euler (s_churn 0), or up to 2 for native ER-SDE with positive s_noise; "
+                            "the first ER-SDE forecast streak stays at 1. Other samplers stay at 1, and "
                             "selective_rollback_correction, anchor_residual_feedback and any model_aware_mode other "
                             "than off force 1. The final quarter of the schedule always stays at 1. "
                             "Quality is unverified: compare at a fixed seed. Longer runs only grow in as window_size "
