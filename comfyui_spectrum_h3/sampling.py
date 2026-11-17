@@ -2509,7 +2509,15 @@ def outer_sample_wrapper(
             if effective_noise_unavailable:
                 resolved_cap = 1
                 er_multi = False
-        if runtime.config.max_forecast_run > 1 and (resolved_cap or 1) < runtime.config.max_forecast_run:
+        if runtime.config.max_forecast_run > 1 and resolved_cap is None:
+            # Unsupported samplers run with forecasting disabled (every step is an
+            # actual evaluation), so "reduced to 1" would misdescribe the run.
+            LOG.warning(
+                "Spectrum H3 max_forecast_run ignored: sampler %s is not supported, so "
+                "forecasting is off and every step is a real evaluation",
+                name,
+            )
+        elif runtime.config.max_forecast_run > 1 and resolved_cap < runtime.config.max_forecast_run:
             if runtime.config.selective_rollback_correction:
                 reason = "selective_rollback_correction forces 1"
             elif runtime.config.anchor_residual_feedback:
@@ -2527,7 +2535,7 @@ def outer_sample_wrapper(
                     f"sampler {name} does not support it (only deterministic native Euler, and native "
                     "ER-SDE with positive s_noise and the reviewed tracking contract)"
                 )
-            LOG.warning("Spectrum H3 max_forecast_run reduced to %s: %s", resolved_cap or 1, reason)
+            LOG.warning("Spectrum H3 max_forecast_run reduced to %s: %s", resolved_cap, reason)
         run_id = runtime.start_run(
             run_sigmas,
             name,
